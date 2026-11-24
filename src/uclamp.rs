@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) The Asahi Linux Contributors
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use log::{info, warn};
+
+/// FreeBSD has no utilization clamping (uclamp_max asks the scheduler for
+/// a small, slow core); keep the default scheduling.
+#[cfg(not(target_os = "linux"))]
+pub fn set_uclamp(uclamp_min: u32, uclamp_max: u32) {
+    info!(
+        "uclamp {}:{} not supported on this OS; using default scheduling",
+        uclamp_min, uclamp_max
+    );
+}
 
 #[derive(Default)]
 #[repr(C)]
@@ -18,6 +30,7 @@ struct SchedAttr {
     sched_util_max: u32,
 }
 
+#[cfg(target_os = "linux")]
 pub fn set_uclamp(uclamp_min: u32, uclamp_max: u32) {
     let mut attr: SchedAttr = Default::default();
     let pid = unsafe { libc::getpid() };

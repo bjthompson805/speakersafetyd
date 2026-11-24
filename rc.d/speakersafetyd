@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# PROVIDE: speakersafetyd
+# REQUIRE: LOGIN kld
+# KEYWORD: shutdown
+#
+# Add to /etc/rc.conf:
+#   speakersafetyd_enable="YES"
+#   speakersafetyd_flags="-m 7"          # default; add --muted for bring-up
+#   speakersafetyd_config="/usr/local/share/speakersafetyd/conf"
+#
+# Runs as root under daemon(8), which restarts it 1 s after any exit:
+# a panic closes /dev/spkctlN and the kernel relocks the speakers; the
+# restart is the cold/warm path of upstream's systemd Restart=on-failure.
+
+. /etc/rc.subr
+
+name="speakersafetyd"
+rcvar="speakersafetyd_enable"
+
+load_rc_config $name
+
+: ${speakersafetyd_enable:="NO"}
+: ${speakersafetyd_flags:="-m 7"}
+: ${speakersafetyd_config:="/usr/local/share/speakersafetyd/conf"}
+
+rundir="/var/run/${name}"
+pidfile="/var/run/${name}.daemon.pid"
+childpidfile="/var/run/${name}.pid"
+procname="/usr/sbin/daemon"
+command="/usr/sbin/daemon"
+# rc.subr puts ${name}_flags before command_args, i.e. on daemon(8)'s
+# command line; take them here for speakersafetyd itself instead.
+_ssd_flags="${speakersafetyd_flags}"
+speakersafetyd_flags=""
+command_args="-r -R 1 -S -T ${name} -P ${pidfile} -p ${childpidfile} \
+	/usr/local/sbin/${name} -c ${speakersafetyd_config} ${_ssd_flags}"
+
+start_precmd="${name}_prestart"
+
+speakersafetyd_prestart()
+{
+	# Holds the cold/warm boot flag file; /var/run is emptied at boot.
+	install -d -m 0755 -o root -g wheel "${rundir}"
+}
+
+run_rc_command "$1"

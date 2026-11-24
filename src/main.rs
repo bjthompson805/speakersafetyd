@@ -22,15 +22,24 @@ use configparser::ini::Ini;
 use log::{debug, info, warn};
 use simple_logger::SimpleLogger;
 
+mod backend;
 mod helpers;
 mod types;
 mod uclamp;
 
+use backend::{CtlId, CtlKind, ReadError};
+
+#[cfg(not(target_os = "freebsd"))]
 const DEFAULT_CONFIG_PATH: &str = "share/speakersafetyd";
+#[cfg(target_os = "freebsd")]
+const DEFAULT_CONFIG_PATH: &str = "share/speakersafetyd/conf";
 
-const UNLOCK_MAGIC: i32 = 0xdec1be15u32 as i32;
+pub const UNLOCK_MAGIC: i32 = 0xdec1be15u32 as i32;
 
+#[cfg(not(target_os = "freebsd"))]
 const FLAGFILE: &str = "/run/speakersafetyd/speakersafetyd.flag";
+#[cfg(target_os = "freebsd")]
+const FLAGFILE: &str = "/var/run/speakersafetyd/speakersafetyd.flag";
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -50,14 +59,27 @@ struct Options {
     /// Maximum gain reduction before panicing (for debugging)
     #[arg(short, long)]
     max_reduction: Option<f32>,
+
+    /// Run the full loop (lock, unlock pings, sense capture, thermal model)
+    /// with every Speaker Volume held at mute, for first hardware bring-up
+    #[arg(long)]
+    muted: bool,
 }
 
+#[cfg(not(target_os = "freebsd"))]
 fn get_machine() -> String {
     fs::read_to_string("/proc/device-tree/compatible")
         .expect("Could not read device tree compatible")
         .split_once("\0")
         .expect("Unexpected compatible format")
         .0
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .to_string()
+}
+
+#[cfg(target_os = "freebsd")]
+fn get_machine() -> String {
+    backend::fdt_compatible()
         .trim_end_matches(|c: char| c.is_ascii_alphabetic())
         .to_string()
 }
@@ -130,15 +152,16 @@ fn main() {
     config_path.set_extension("conf");
     info!("Config file: {:?}", config_path);
 
-    let maker_titlecase = maker[0..1].to_ascii_uppercase() + &maker[1..];
-
-    let device = format!("hw:{}{}", maker_titlecase, model.to_ascii_uppercase());
-    info!("Device: {}", device);
+    let (maker, model) = (maker.to_string(), model.to_string());
 
     let mut cfg: Ini = Ini::new_cs();
     cfg.load(config_path).expect("Failed to read config file");
 
-    let globals = types::Globals::parse(&cfg);
+    let mut globals = types::Globals::parse(&cfg);
+    globals.muted = args.muted;
+    if globals.muted {
+        warn!("--muted: every Speaker Volume is held at mute");
+    }
     // Reject invalid delay and ceiling declarations before opening mixer controls.
     for name in get_speakers(&cfg) {
         types::Speaker::parse_sense_delay(&name, &cfg);
@@ -166,7 +189,7 @@ fn main() {
         info!("Found {} speakers", speaker_count);
 
         info!("Opening control device");
-        let ctl: alsa::ctl::Ctl = helpers::open_card(&device);
+        let ctl = backend::Card::open(&maker, &model);
 
         let flag_path = Path::new(FLAGFILE);
 
@@ -205,26 +228,18 @@ fn main() {
         assert!(groups.values().map(|a| a.speakers.len()).sum::<usize>() == speaker_count);
         assert!(2 * speaker_count <= globals.channels);
 
-        let pcm_name = format!("{},{}", device, globals.visense_pcm);
         // Set up PCM to buffer in V/ISENSE
-        let mut pcm: Option<alsa::pcm::PCM> = Some(helpers::open_pcm(
-            &pcm_name,
-            globals.channels.try_into().unwrap(),
-            0,
-        ));
-        let mut io = Some(pcm.as_ref().unwrap().io_i16().unwrap());
+        let mut pcm: Option<backend::SensePcm> = Some(backend::SensePcm::open(&ctl, &globals));
 
-        let mut sample_rate_elem = types::Elem::new(
-            "Speaker Sample Rate".to_string(),
+        let mut sample_rate_elem = backend::Elem::new(
+            CtlId::card("Speaker Sample Rate", CtlKind::SampleRate),
             &ctl,
-            alsa::ctl::ElemType::Integer,
         );
         let mut sample_rate = sample_rate_elem.read_int(&ctl);
 
-        let mut unlock_elem = types::Elem::new(
-            "Speaker Volume Unlock".to_string(),
+        let mut unlock_elem = backend::Elem::new(
+            CtlId::card("Speaker Volume Unlock", CtlKind::Unlock),
             &ctl,
-            alsa::ctl::ElemType::Integer,
         );
 
         unlock_elem.write_int(&ctl, UNLOCK_MAGIC);
@@ -254,7 +269,7 @@ fn main() {
                 panic!("SIGQUIT received");
             }
             // Block while we're reading into the buffer
-            let read = io.as_ref().unwrap().readi(&mut buf);
+            let read = pcm.as_mut().unwrap().readi(&mut buf);
 
             #[allow(unused_mut)]
             #[allow(unused_assignments)]
@@ -264,7 +279,21 @@ fn main() {
                     if sigquit.load(Ordering::Relaxed) {
                         panic!("SIGQUIT received");
                     }
-                    if e.errno() == libc::ESTRPIPE {
+                    if let ReadError::NoData = e {
+                        // FreeBSD: nothing played for hw.snd.timeout seconds.
+                        // The unlock lease does not run while stopped; keep
+                        // pinging so an error (ETIMEDOUT) still panics, and
+                        // never carry sense history across the gap.
+                        debug!("Sense PCM idle");
+                        for group in groups.values_mut() {
+                            for speaker in &mut group.speakers {
+                                speaker.reset_sense_history();
+                            }
+                        }
+                        unlock_elem.write_int(&ctl, UNLOCK_MAGIC);
+                        continue;
+                    }
+                    if let ReadError::Suspended = e {
                         warn!("Suspend detected!");
                         /*
                         // Resume handling
@@ -280,14 +309,8 @@ fn main() {
                         */
                         // Work around kernel issue: resume sometimes breaks visense
                         warn!("Reinitializing PCM to work around kernel bug...");
-                        io = None;
                         pcm = None;
-                        pcm = Some(helpers::open_pcm(
-                            &pcm_name,
-                            globals.channels.try_into().unwrap(),
-                            0,
-                        ));
-                        io = Some(pcm.as_ref().unwrap().io_i16().unwrap());
+                        pcm = Some(backend::SensePcm::open(&ctl, &globals));
                         for group in groups.values_mut() {
                             for speaker in &mut group.speakers {
                                 speaker.reset_sense_history();
@@ -298,7 +321,7 @@ fn main() {
                     Err(e)
                 }
             }
-            .unwrap();
+            .unwrap_or_else(|e| panic!("Sense PCM read failed: {:?}", e));
 
             if read != globals.period {
                 warn!("Expected {} samples, got {}", globals.period, read);

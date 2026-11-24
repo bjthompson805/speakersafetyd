@@ -36,7 +36,7 @@ const SNDCTL_DSP_SPEED: libc::c_ulong = 0xc004_5002;
 const SNDCTL_DSP_SETFMT: libc::c_ulong = 0xc004_5005;
 const SNDCTL_DSP_CHANNELS: libc::c_ulong = 0xc004_5006;
 const SNDCTL_DSP_SETFRAGMENT: libc::c_ulong = 0xc004_500a;
-const AFMT_S16_LE: libc::c_int = 0x10;
+const AFMT_S32_LE: libc::c_int = 0x1000;
 
 /// TLV mute value alsa-lib reports as a dB range minimum.
 const SND_CTL_TLV_DB_GAIN_MUTE: i64 = -9999999;
@@ -395,14 +395,17 @@ impl SensePcm {
             warn!("{}: SNDCTL_DSP_SETFRAGMENT: {}", path, io::Error::last_os_error());
         }
 
-        let fmt = ioctl(SNDCTL_DSP_SETFMT, AFMT_S16_LE, "SNDCTL_DSP_SETFMT");
-        assert_eq!(fmt, AFMT_S16_LE, "{}: format is {:#x}, not S16_LE", path, fmt);
+        // sound(4) carries at most 8 channels, so the kernel presents the
+        // frame of `channels` S16 words as channels / 2 S32 words: the same
+        // bytes, read back here in place as S16.
+        let fmt = ioctl(SNDCTL_DSP_SETFMT, AFMT_S32_LE, "SNDCTL_DSP_SETFMT");
+        assert_eq!(fmt, AFMT_S32_LE, "{}: format is {:#x}, not S32_LE", path, fmt);
         let ch = ioctl(
             SNDCTL_DSP_CHANNELS,
-            globals.channels as libc::c_int,
+            (globals.channels / 2) as libc::c_int,
             "SNDCTL_DSP_CHANNELS",
         );
-        assert_eq!(ch as usize, globals.channels, "{}: {} channels", path, ch);
+        assert_eq!(ch as usize * 2, globals.channels, "{}: {} channels", path, ch);
         let rate = ioctl(SNDCTL_DSP_SPEED, SENSE_RATE, "SNDCTL_DSP_SPEED");
         assert_eq!(rate, SENSE_RATE, "{}: rate {}", path, rate);
         println!("PCM rate: {}..{}", rate, rate);

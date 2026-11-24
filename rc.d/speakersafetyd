@@ -34,7 +34,7 @@ command="/usr/sbin/daemon"
 # command line; take them here for speakersafetyd itself instead.
 _ssd_flags="${speakersafetyd_flags}"
 speakersafetyd_flags=""
-command_args="-r -R 1 -S -T ${name} -P ${pidfile} -p ${childpidfile} \
+command_args="-f -r -R 1 -S -T ${name} -P ${pidfile} -p ${childpidfile} \
 	/usr/local/sbin/${name} -c ${speakersafetyd_config} ${_ssd_flags}"
 
 start_precmd="${name}_prestart"
